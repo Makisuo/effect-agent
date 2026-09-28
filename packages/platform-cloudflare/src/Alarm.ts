@@ -348,7 +348,7 @@ const earliestDeadline = (
       : left
     : right;
 
-/** @internal A committed source operation must not become a failed operation because delivery failed. */
+/** @internal Required host publication only; native lifecycle facts use a maintenance lane. */
 export const publishCommitted = Effect.gen(function* () {
   const publication = yield* ThreadPublication;
 

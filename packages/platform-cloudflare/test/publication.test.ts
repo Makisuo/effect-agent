@@ -3,7 +3,6 @@ import { Clock, Effect, Option, Schema } from "effect";
 import { DurableAgentRuntime } from "effect-agent/durable-agent-runtime";
 import { ThreadId } from "effect-agent/identifiers";
 import { ApprovalDecisionCommand, SubmissionLedger } from "effect-agent/submission-ledger";
-import { ThreadStore } from "effect-agent/thread-store";
 import { DurableObject } from "effect-cf";
 import { TestClock } from "effect/testing";
 import { describe, expect, it } from "vite-plus/test";
@@ -40,6 +39,7 @@ import {
   publicationControls,
   publicationResources,
   failedLifecycleThreads,
+  lifecycleBatches,
 } from "./publication-fixture.ts";
 
 const namespace = "PUBLICATIONS";
@@ -51,6 +51,26 @@ const alarm = (thread: string) =>
 const cursor = (thread: string) =>
   runInDurableObject(stub(thread), async (_, state) =>
     Schema.decodeUnknownSync(PublicationCursor)(await state.storage.get(PUBLICATION_KEY)),
+  );
+
+const lifecycleRows = (thread: string) =>
+  runInDurableObject(stub(thread), (_, state) =>
+    Schema.decodeUnknownSync(
+      Schema.Array(
+        Schema.Struct({
+          id: Schema.String,
+          ordinal: Schema.Number,
+          fingerprint: Schema.String,
+          payload_json: Schema.NullOr(Schema.String),
+        }),
+      ),
+    )(
+      state.storage.sql
+        .exec(
+          "SELECT id, ordinal, fingerprint, payload_json FROM effect_agent_lifecycle_publications ORDER BY ordinal",
+        )
+        .toArray(),
+    ),
   );
 
 const generation = (thread: string) =>
@@ -107,6 +127,7 @@ const withThread = (
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           failedLifecycleThreads.delete(thread);
+          lifecycleBatches.delete(thread);
           modelRequestHolds.delete(thread);
           publicationControls.delete(thread);
           publicationResources.delete(thread);
@@ -131,7 +152,8 @@ const latch = () => {
 };
 
 describe("durable host publication", () => {
-  it("gates the actual routed runtime on retained lifecycle debt before invoking a provider", () =>
+  // Regression: c68edc7a made host publication an execution prerequisite.
+  it("runs routed and alarm attempts with publication debt, then publishes bounded ordered batches", () =>
     withThread(async (thread, _now, advance) => {
       let providerCalls = 0;
 
@@ -144,7 +166,6 @@ describe("durable host publication", () => {
       failedLifecycleThreads.add(thread);
       const receipt = await submit(thread);
       const threadId = Schema.decodeSync(ThreadId)(thread);
-      const foreignId = Schema.decodeSync(ThreadId)("foreign-owner");
 
       const result = await runInDurableObject(stub(thread), (instance) =>
         instance[DurableObject.RunSymbol](
@@ -152,29 +173,65 @@ describe("durable host publication", () => {
         ),
       );
 
-      expect(providerCalls).toBe(0);
-      expect(Option.isNone(result)).toBe(true);
+      expect(providerCalls).toBe(1);
+      expect(Option.isSome(result)).toBe(true);
       expect((await laneRows(thread, namespace))[0]?.submission_id).toBe(receipt.submissionId);
+      expect(lifecycleBatches.get(thread) ?? []).toEqual([]);
 
-      const foreignDeadline = await runInDurableObject(stub(thread), (instance) =>
-        instance[DurableObject.RunSymbol](
-          ThreadStore.use((store) =>
-            store.lifecyclePublications === undefined
-              ? Effect.die("Missing lifecycle storage")
-              : store.lifecyclePublications.pendingDeadlineFor(foreignId).pipe(Effect.flip),
+      await runClient(
+        CloudflareThreadClient.use((client) =>
+          client.submit(
+            { definition: plannerDefinition },
+            { question: "follow-up", ref: thread },
+            submitOptions(thread, "follow-up"),
           ),
         ),
+        namespace,
       );
+      await alarm(thread).catch(() => undefined);
+      expect(providerCalls).toBe(2);
+      expect(await allSettled(thread, namespace)()).toBe(true);
 
-      expect(foreignDeadline).toMatchObject({
-        _tag: "LifecyclePublicationError",
-        reason: "unavailable",
-      });
+      // Regression: bce45cdd loaded the entire owner backlog before persisting a retry.
+      await runClient(
+        CloudflareThreadClient.use((client) =>
+          client.submit(
+            { definition: plannerDefinition },
+            { question: "backlog", ref: thread },
+            submitOptions(thread, "backlog"),
+          ),
+        ),
+        namespace,
+      );
+      await alarm(thread).catch(() => undefined);
+      expect(providerCalls).toBe(3);
+      expect(lifecycleBatches.get(thread)).toHaveLength(1);
+      lifecycleBatches.delete(thread);
+
+      const before = await lifecycleRows(thread);
+
+      expect(before.length).toBeGreaterThan(8);
+      expect(before.every((row) => row.payload_json !== null)).toBe(true);
       failedLifecycleThreads.delete(thread);
       await advance(11_000);
-      await drainAlarmsUntil(thread, allSettled(thread, namespace), { namespace });
-      expect(providerCalls).toBe(1);
-      expect((await laneRows(thread, namespace))[0]?.submission_id).toBe(receipt.submissionId);
+      await quiesce(thread);
+      const batches = lifecycleBatches.get(thread) ?? [];
+
+      expect(batches.every((batch) => batch.length <= 8)).toBe(true);
+      expect(batches.flatMap((batch) => batch.map((fact) => fact.id))).toEqual(
+        before.map((row) => row.id),
+      );
+      expect(batches.flatMap((batch) => batch.map((fact) => fact.ordinal))).toEqual(
+        before.map((row) => row.ordinal),
+      );
+      expect(batches[0]?.slice(0, 3).map((fact) => fact.fact._tag)).toEqual([
+        "SubmissionReady",
+        "UserInputRecorded",
+        "RunStarted",
+      ]);
+      expect(await lifecycleRows(thread)).toEqual(
+        before.map((row) => ({ ...row, payload_json: null })),
+      );
     }, true));
 
   it("rebuilt maintenance observes an in-flight native ledger producer through the exported gate", () =>
@@ -289,6 +346,8 @@ describe("durable host publication", () => {
       publicationControls.set(thread, { failure: "failure" });
       const receipt = await submit(thread);
 
+      // Regression: bce45cdd skipped the required custom host-publication hook.
+      expect(publicationResources.get(thread)?.acquired ?? 0).toBeGreaterThan(0);
       expect((await laneRows(thread, namespace))[0]?.submission_id).toBe(receipt.submissionId);
       expect(await scheduledAlarm(thread, namespace)).not.toBeNull();
       publicationControls.delete(thread);
