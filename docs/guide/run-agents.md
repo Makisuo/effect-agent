@@ -282,7 +282,25 @@ When the completing run has exhausted its budget, follow-ups stay queued for a n
 Durable runs drain the ready input prefix together, subject to the host ledger's
 joining policy and the runtime batch bound. Each joined input retains its receipt;
 only a later host response covers it. Inputs rejected by the prompt callback remain
-queued for their own run instead of failing the host or later queued inputs.
+queued for their own run without cancelling the host's model call. Recovery restores
+all previously consumed, uncovered joins before the next call; the batch bound applies
+to newly ready inputs.
+
+Set `policy: { restartOnJoinedInput: true }` on an agent to let eligible joined input
+replace a running model call. The first call starts immediately. The runtime cancels
+only the disposable model stream, before any response commits or application tool
+starts, and restarts with the combined input. It permits two replacements per run,
+including across durable recovery; later joins use the ordinary seams. Calls exposing
+provider-defined tools keep seam steering because remote execution may precede streamed
+evidence. Joining authority, receipts, and settlement are unchanged.
+
+Streaming clients must clear text and reasoning drafts for the `turnId` in a
+`ModelRestarted` event. Its reason is `joined-input`; the replacement has a new turn ID.
+Durable hosts retain the replacement count and any reported usage before the next call.
+Cancelled `chat <model>` spans end interrupted with `effect_agent.model.outcome=aborted`
+and `effect_agent.model.abort_reason=joined-input`. Unreported usage remains unknown.
+Custom input adapters supply `RunInputHook.awaitJoin` to enable the same behavior;
+durable adapters also implement `RunDurabilityHook.commitModelRestart`.
 
 ## Add per-run hooks {#operational-hooks}
 
