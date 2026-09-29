@@ -22,6 +22,9 @@ export const BrowserRunProofStage = Schema.Literals([
   "file-upload",
 ]);
 
+/** A provider's typed failure class; only tags and backoff hints leave the proof Worker. */
+export const ProviderTag = Schema.String.check(Schema.isPattern(/^[A-Za-z][A-Za-z0-9]{0,63}$/));
+
 export class BrowserRunWorkerProofFailure extends Schema.Class<BrowserRunWorkerProofFailure>(
   "BrowserRunWorkerProofFailure",
 )({
@@ -39,6 +42,8 @@ export class BrowserRunWorkerProofFailure extends Schema.Class<BrowserRunWorkerP
     ]),
   ),
   cleanupStatus: Schema.optionalKey(Schema.Int),
+  providerTag: Schema.optionalKey(ProviderTag),
+  retryAfterMillis: Schema.optionalKey(Schema.Natural),
 }) {}
 
 export const describeBrowserRunProofFailure = (status: number, body: unknown): string => {
@@ -46,7 +51,7 @@ export const describeBrowserRunProofFailure = (status: number, body: unknown): s
 
   const failure = Schema.decodeUnknownOption(BrowserRunWorkerProofFailure)(body);
 
-  if (Option.isNone(failure)) return `${prefix}; invocation was not retried`;
+  if (Option.isNone(failure)) return prefix;
 
   const detail = failure.value;
 
@@ -55,17 +60,50 @@ export const describeBrowserRunProofFailure = (status: number, body: unknown): s
   const cleanupStatus =
     detail.cleanupStatus === undefined ? "" : `; cleanupStatus=${detail.cleanupStatus}`;
 
-  return `${prefix}; stage=${detail.stage}${cleanup}${cleanupStatus}; invocation was not retried`;
+  const provider = detail.providerTag === undefined ? "" : `; provider=${detail.providerTag}`;
+
+  const retryAfter =
+    detail.retryAfterMillis === undefined ? "" : `; retryAfterMillis=${detail.retryAfterMillis}`;
+
+  return `${prefix}; stage=${detail.stage}${cleanup}${cleanupStatus}${provider}${retryAfter}`;
 };
+
+// Stateless Quick Actions run before the proof opens any browser session.
+const quickActionStages = new Set<typeof BrowserRunProofStage.Type>([
+  "capture",
+  "scrape",
+  "screenshot",
+]);
+
+// Rate limits stay final: adapters cannot reliably tell a rate limit from exhausted quota.
+const transientProviderTags = new Set(["PageCaptureProtocolError", "PageCaptureNavigationError"]);
+
+/**
+ * A provider protocol or navigation failure in a Quick Action stage left no browser to clean up
+ * and no fixture state, so the whole proof may run again. Rate limits, long backoff hints,
+ * product assertions and every later stage are final.
+ */
+export const transientBrowserRunProofFailure = (
+  body: unknown,
+): Option.Option<BrowserRunWorkerProofFailure> =>
+  Schema.decodeUnknownOption(BrowserRunWorkerProofFailure)(body).pipe(
+    Option.filter(
+      (detail) =>
+        quickActionStages.has(detail.stage) &&
+        detail.providerTag !== undefined &&
+        transientProviderTags.has(detail.providerTag) &&
+        (detail.retryAfterMillis ?? 0) <= 60_000,
+    ),
+  );
 
 class ProofFailureBodyTooLarge extends Data.TaggedError("ProofFailureBodyTooLarge")<{
   readonly limit: number;
 }> {}
 
-export const describeBrowserRunProofFailureFromStream = <E, R>(
-  status: number,
+/** Reads at most 4 KiB of JSON; an oversized, slow or malformed body becomes `null`. */
+export const readBrowserRunProofFailure = <E, R>(
   stream: Stream.Stream<Uint8Array, E, R>,
-): Effect.Effect<string, never, R> =>
+): Effect.Effect<unknown, never, R> =>
   Stream.runFoldEffect(
     stream,
     () => new Uint8Array(),
@@ -85,8 +123,15 @@ export const describeBrowserRunProofFailureFromStream = <E, R>(
       Effect.try(() => new TextDecoder("utf-8", { fatal: true }).decode(bytes)),
     ),
     Effect.flatMap(Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))),
-    Effect.map((body) => describeBrowserRunProofFailure(status, body)),
-    Effect.orElseSucceed(() => describeBrowserRunProofFailure(status, null)),
+    Effect.orElseSucceed(() => null),
+  );
+
+export const describeBrowserRunProofFailureFromStream = <E, R>(
+  status: number,
+  stream: Stream.Stream<Uint8Array, E, R>,
+): Effect.Effect<string, never, R> =>
+  Effect.map(readBrowserRunProofFailure(stream), (body) =>
+    describeBrowserRunProofFailure(status, body),
   );
 
 const ScreenshotProof = Schema.Struct({

@@ -1,6 +1,18 @@
 import * as Cloudflare from "alchemy/Cloudflare";
 import * as Test from "alchemy/Test/Vitest";
-import { Cause, Clock, Config, Console, Effect, Exit, FileSystem, Layer, Schema } from "effect";
+import {
+  Cause,
+  Clock,
+  Config,
+  Console,
+  Effect,
+  Exit,
+  FileSystem,
+  Layer,
+  Option,
+  Schedule,
+  Schema,
+} from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -26,8 +38,11 @@ import { checkoutStack } from "../src/checkout-stack.ts";
 import { assertPurchase, expectedQuote, sameQuote } from "../src/checkout-store.ts";
 import {
   BrowserRunWorkerProofResult,
-  describeBrowserRunProofFailureFromStream,
+  describeBrowserRunProofFailure,
+  PROOF_FACT,
   PROOF_SOURCE_PATH,
+  readBrowserRunProofFailure,
+  transientBrowserRunProofFailure,
 } from "../src/contract.ts";
 
 // Only prove:live collects this file. The same stage is reusable only for explicit retirement.
@@ -62,6 +77,12 @@ const updateReport = Effect.fnUntraced(function* (
 ) {
   yield* (yield* CheckoutReport).update((report) => (report === undefined ? undefined : f(report)));
 });
+
+const recordRetry = (retry: NonNullable<typeof Report.Type.infrastructureRetries>[number]) =>
+  updateReport((report) => ({
+    ...report,
+    infrastructureRetries: [...(report.infrastructureRetries ?? []), retry],
+  }));
 
 const measure = Effect.fnUntraced(function* <A, E, R>(
   phase: keyof typeof Timings.Type,
@@ -100,6 +121,32 @@ const workerStatus = Effect.fnUntraced(function* (name: string) {
 
   return response.status;
 });
+
+/** New workers.dev routes can lag deployment; each origin must serve its own fixture first. */
+const awaitOrigin = Effect.fnUntraced(function* (url: URL, marker: string) {
+  const client = yield* HttpClient.HttpClient;
+
+  yield* client.get(url).pipe(
+    Effect.filterOrFail(
+      (response) => response.status === 200,
+      (response) => failure("deployment", `${url.origin} returned HTTP ${response.status}`),
+    ),
+    Effect.flatMap((response) => response.text),
+    Effect.filterOrFail(
+      (text) => text.includes(marker),
+      () => failure("deployment", `${url.origin} did not serve its fixture`),
+    ),
+    Effect.timeout("10 seconds"),
+    Effect.retry({ schedule: Schedule.spaced("2 seconds") }),
+    Effect.timeoutOrElse({
+      duration: "2 minutes",
+      orElse: () =>
+        failure("deployment", `${url.origin} did not serve its fixture within two minutes`),
+    }),
+  );
+});
+
+const bindingAttempts = 3;
 
 const call = Effect.fn("CheckoutProof.request")(function* <
   S extends Schema.Top & { readonly DecodingServices: never },
@@ -329,33 +376,56 @@ const proof = Effect.gen(function* () {
   shopUrl = deployed.shopUrl;
   const bindingUrl = deployed.bindingUrl;
 
-  yield* measure("readinessMillis", Effect.sleep("15 seconds"));
+  const merchant = new URL("/ready", deployed.processorUrl);
+
+  merchant.searchParams.set("merchant", new URL("/s/readiness", shopUrl).href);
+  yield* measure(
+    "readinessMillis",
+    Effect.all(
+      [
+        awaitOrigin(new URL(PROOF_SOURCE_PATH, bindingUrl), PROOF_FACT),
+        awaitOrigin(new URL("/health", shopUrl), "checkout-v1"),
+        awaitOrigin(merchant, "Card ready"),
+      ],
+      { concurrency: "unbounded", discard: true },
+    ),
+  );
   const client = yield* HttpClient.HttpClient;
 
   yield* measure(
     "bindingProofMillis",
     Effect.gen(function* () {
-      const bindingResponse = yield* client.get(bindingUrl).pipe(Effect.timeout("150 seconds"));
+      for (let attempt = 1; ; attempt++) {
+        const bindingResponse = yield* client.get(bindingUrl).pipe(Effect.timeout("150 seconds"));
 
-      if (bindingResponse.status !== 200) {
-        return yield* failure(
-          "binding-proof",
-          yield* describeBrowserRunProofFailureFromStream(
-            bindingResponse.status,
-            bindingResponse.stream,
-          ),
-        );
+        if (bindingResponse.status === 200) {
+          const result = yield* bindingResponse.json.pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(BrowserRunWorkerProofResult)),
+          );
+
+          const expectedSource = new URL(PROOF_SOURCE_PATH, bindingUrl).href;
+
+          if (result.sourceUrl !== expectedSource || result.interactive.finalUrl !== expectedSource)
+            return yield* failure(
+              "binding-proof",
+              "The browser proof used a different source page",
+            );
+
+          return yield* updateReport((report) => ({ ...report, bindingProof: true }));
+        }
+        const body = yield* readBrowserRunProofFailure(bindingResponse.stream);
+        const description = describeBrowserRunProofFailure(bindingResponse.status, body);
+        const transient = transientBrowserRunProofFailure(body);
+
+        if (Option.isNone(transient) || attempt === bindingAttempts)
+          return yield* failure(
+            "binding-proof",
+            `${description}; ${Option.isNone(transient) ? "not retryable" : "transient retries exhausted"}${attempt > 1 ? ` after ${attempt} attempts` : ""}`,
+          );
+        yield* recordRetry({ stage: "binding-proof", failure: description });
+        // Stay above the Worker's Quick Action pacing and honor the provider's own hint.
+        yield* Effect.sleep(Math.max(15_000 * attempt, transient.value.retryAfterMillis ?? 0));
       }
-
-      const result = yield* bindingResponse.json.pipe(
-        Effect.flatMap(Schema.decodeUnknownEffect(BrowserRunWorkerProofResult)),
-      );
-
-      const expectedSource = new URL(PROOF_SOURCE_PATH, bindingUrl).href;
-
-      if (result.sourceUrl !== expectedSource || result.interactive.finalUrl !== expectedSource)
-        return yield* failure("binding-proof", "The browser proof used a different source page");
-      yield* updateReport((report) => ({ ...report, bindingProof: true }));
     }),
   );
 
@@ -463,10 +533,11 @@ const proof = Effect.gen(function* () {
   );
   const report = yield* currentReport;
 
+  // A case can allocate a browser before it fails, so no case is ever replaced.
   if (report?.completed !== report?.attempted)
     return yield* failure(
       "assertion",
-      "Checkout failures retained in .checkout-proof; no attempts were retried",
+      "Checkout failures retained in .checkout-proof; cases are never retried",
     );
 }).pipe(
   Effect.tapCause((cause) =>

@@ -350,6 +350,15 @@ export const Report = Schema.Struct({
   completed: Schema.Natural,
   attempted: Schema.Natural,
   completionRate: Schema.Finite,
+  // Retried binding-proof provider failures, which open no browser session. Cases never retry.
+  infrastructureRetries: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({
+        stage: Schema.Literal("binding-proof"),
+        failure: Schema.String,
+      }),
+    ),
+  ),
   cleanup: Schema.Literals(["pending", "browsers-closed", "confirmed", "failed"]),
   providerCompatibility: Schema.Literal("not-established"),
 });
