@@ -114,6 +114,53 @@ Choose `ExactHosts` for a known site. Let a trusted host, never model output, ch
 `Unrestricted`. One policy also fixes maximum actions, elapsed time, and bytes returned by each
 operation.
 
+## Opt into decision-grounded browser tools
+
+`BrowserUse.make` pairs a browser toolkit with its handler Layer. Choose grounding and
+batching once; the host supplies the page adapter and provider.
+
+```ts twoslash
+import { BrowserUse } from "effect-agent";
+import { TypeSafeClient, TypeSafeDecisionModel } from "@effect/ai-typesafe";
+import { Config, Layer } from "effect";
+import { FetchHttpClient } from "effect/unstable/http";
+
+const browser = BrowserUse.make({ grounding: "decision" });
+// Include browser.toolkit in your Agent; merge your own completion tool if needed.
+const JevLive = TypeSafeDecisionModel.layer({ model: "jev-latest" }).pipe(
+  Layer.provide(TypeSafeClient.layerConfig({ apiKey: Config.Redacted("TYPESAFE_API_KEY") })),
+  Layer.provide(FetchHttpClient.layer),
+);
+const handlers = browser.layer().pipe(Layer.provide(JevLive));
+// handlers still requires BrowserUse.BrowserActions, supplied by your page adapter.
+```
+
+`BrowserUse.make()` defaults to direct, single actions: the planner supplies an observed
+`ref`, as in `{ action: { kind: "click", ref: "save" } }`. With
+`grounding: "decision"`, it describes `{ action: { kind: "click", target: "Save this task" } }`
+and the supplied native `DecisionModel` selects the control. Add `mode: "batched"` to either
+configuration to accept `actions` arrays of up to eight items. The planner remains your
+ordinary Language Model. Grounding introduces no fallback planner.
+
+`BrowserActions` owns observation and dispatch. Its adapter assigns unique refs, limits the
+exposed page data, revalidates targets before input, and enforces navigation and action authority.
+It returns acknowledged action counts even when later observation fails; no handler replays
+completed actions. Browser lifetime, credentials, approvals, and outcome verification stay with
+the host. See the [browser speed lab](https://github.com/danieljvdm/effect-agent/tree/main/examples/browser-speed) for a complete
+adapter using Cloudflare Browser Sessions, tracing, and an independent verifier.
+
+Build one grounded handler Layer per page/run. It serializes observation and selection, keeps the
+latest observation, and discards stale evidence after a failed operation.
+`browser.layer({ initialObservation })` avoids rereading an already prepared page. Selection permits 1–254
+compatible controls per action, includes an abstention choice, requires probability at least 0.6,
+and times out after 15 seconds. These are selection limits, not correctness guarantees. Direct
+`selectTargets` returns choices and token usage for custom tools; it requires only `DecisionModel`.
+Grounded handlers emit `BrowserUse.selectTargets` spans with choices and token usage in the
+`browser.selection` attribute; use standard Effect tracing to observe them.
+
+Wikipedia routing and Kitesurf connection setup remain example-owned. The lab's Browser Sessions
+adapter does not use `InteractiveBrowser`'s separate guarded-action implementation.
+
 ## Capture one rendered page from Node
 
 This complete composition captures rendered Markdown through the Node-safe REST adapter. The
