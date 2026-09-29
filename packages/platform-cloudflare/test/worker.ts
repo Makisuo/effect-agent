@@ -15,6 +15,7 @@ import { makeSubscriptionPartitionObjectClass } from "@effect-agent/platform-clo
 import * as ThreadObject from "@effect-agent/platform-cloudflare/thread-object";
 import { PortRequest } from "@effect-agent/storage-cloudflare/port-protocol";
 import { Clock, Effect, Layer, Schema } from "effect";
+import { CurrentBindingSelection } from "effect-agent/agent-registration";
 import { DurableAgentRuntime } from "effect-agent/durable-agent-runtime";
 import { RecalledMemory } from "effect-agent/memory";
 import { MemoryLookup } from "effect-agent/memory-reference";
@@ -45,6 +46,7 @@ import {
   makeContextAuthorizationLayer,
   testRuntimeLayer,
   makeTestBindings,
+  maintenanceBindings,
   runtimeEvictionFailpoint,
   notifyScheduleAlarmCompleted,
   scheduleAuthorizer,
@@ -312,31 +314,41 @@ export class TestThreadObject extends ThreadObject.make(
                 existing,
                 threadId.startsWith("recovery-retirement-") ? hostMaintenanceLayer : undefined,
               ).pipe(Layer.provideMerge(layerFromBindings([])))
-            : unavailableBindingThreads.has(threadId)
-              ? layerFromBindings([])
-              : upgradedBookBindingThreads.has(threadId)
-                ? Layer.unwrap(
-                    Effect.map(upgradedBookBinding, (replacement) =>
-                      layerFromBindings([
-                        ...existing.filter((binding) => binding.agentId !== replacement.agentId),
-                        replacement,
-                        ...workers,
-                      ]),
+            : maintenanceBindings.has(threadId)
+              ? layerFromBindings(maintenanceBindings.get(threadId)!.bindings).pipe(
+                  Layer.provide(
+                    Layer.succeed(
+                      CurrentBindingSelection,
+                      maintenanceBindings.get(threadId)!.selection,
                     ),
-                  )
-                : threadId.startsWith("background-cf-custom-") || customRuntimeThreads.has(threadId)
-                  ? Layer.fresh(ThreadMaintenance.layer).pipe(
-                      Layer.provideMerge(
-                        DurableAgentRuntime.layerWithBindings([...existing, ...workers]),
+                  ),
+                )
+              : unavailableBindingThreads.has(threadId)
+                ? layerFromBindings([])
+                : upgradedBookBindingThreads.has(threadId)
+                  ? Layer.unwrap(
+                      Effect.map(upgradedBookBinding, (replacement) =>
+                        layerFromBindings([
+                          ...existing.filter((binding) => binding.agentId !== replacement.agentId),
+                          replacement,
+                          ...workers,
+                        ]),
                       ),
-                      Layer.provideMerge(layerFromBindings([])),
                     )
-                  : threadId.startsWith("messages-")
+                  : threadId.startsWith("background-cf-custom-") ||
+                      customRuntimeThreads.has(threadId)
                     ? Layer.fresh(ThreadMaintenance.layer).pipe(
-                        Layer.provide(testMessageRecovery),
-                        Layer.provideMerge(layerFromBindings([...existing, ...workers])),
+                        Layer.provideMerge(
+                          DurableAgentRuntime.layerWithBindings([...existing, ...workers]),
+                        ),
+                        Layer.provideMerge(layerFromBindings([])),
                       )
-                    : layerFromBindings([...existing, ...workers]),
+                    : threadId.startsWith("messages-")
+                      ? Layer.fresh(ThreadMaintenance.layer).pipe(
+                          Layer.provide(testMessageRecovery),
+                          Layer.provideMerge(layerFromBindings([...existing, ...workers])),
+                        )
+                      : layerFromBindings([...existing, ...workers]),
         ),
       ),
     ),

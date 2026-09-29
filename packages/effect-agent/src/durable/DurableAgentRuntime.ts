@@ -151,6 +151,7 @@ import {
   type ResolvedBinding,
   resolveDefinitionBinding,
   resolveWorkerBinding,
+  CurrentBindingSelection,
 } from "./internal/agent-registration.ts";
 import { makeAgentUpdateRuntime } from "./internal/agent-updates.ts";
 import { inspectForeignDiagnostic, safeUnknownString } from "./internal/foreign-diagnostic.ts";
@@ -1259,6 +1260,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
   bindings: ReadonlyArray<ResolvedBinding>,
 ) {
   const registeredBindings = [...bindings];
+  const bindingSelection = yield* CurrentBindingSelection;
   const workerAdmissionPort = yield* WorkerAdmissionPort;
   const ledger = yield* SubmissionLedger;
   const submissionScheduling = yield* SubmissionScheduling;
@@ -1303,20 +1305,11 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
     Effect.provideService(effect, Crypto.Crypto, crypto);
 
   const contractsFor = (definition: Agent.AnyDefinition) => {
-    const registered = registeredBindings.filter((binding) => binding.agentId === definition.id);
-    const binding = registered.length === 1 ? registered[0] : undefined;
+    const registered = registeredBindings.filter(
+      (binding) => binding.agentId === definition.id && Object.is(binding.definition, definition),
+    );
 
-    // Attempts may restore the accepted Run policy on a Definition copy. Replay contracts
-    // describe Tools, so retain the registration's semantic versions while all declarations
-    // that affect those contracts are unchanged. Replaced Tools or completion declarations
-    // must not inherit another executable's replay authority.
-    const current =
-      binding?.definition.toolkit === definition.toolkit &&
-      binding.definition.completion === definition.completion &&
-      binding.definition.completionFromTools === definition.completionFromTools
-        ? binding
-        : undefined;
-
+    const current = registered.length === 1 ? registered[0] : undefined;
     const contracts = current?.digests.replay?.tools;
 
     return contracts === undefined
@@ -1326,9 +1319,15 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
       : Effect.succeed(contracts);
   };
 
-  const currentOperationsFor = Effect.fnUntraced(function* (agentId: AgentId) {
-    const registered = registeredBindings.filter((binding) => binding.agentId === agentId);
-    const binding = registered.length === 1 ? registered[0] : undefined;
+  const resolveCurrentBinding = (submission: SubmissionSnapshot) =>
+    resolveWorkerBinding(registeredBindings, submission).pipe(
+      Effect.provideService(CurrentBindingSelection, bindingSelection),
+    );
+
+  const currentOperationsFor = Effect.fnUntraced(function* (submission: SubmissionSnapshot) {
+    const binding = yield* resolveCurrentBinding(submission).pipe(
+      Effect.catchTag("BindingUnavailable", () => Effect.succeed(undefined)),
+    );
 
     return binding === undefined
       ? undefined
@@ -4553,6 +4552,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
     journalMetadata: JournalMetadata | undefined,
     lineage: AttemptLineage,
     approvalDecisions: ReadonlyArray<ApprovalDecisionIntent>,
+    currentContracts: Readonly<Record<string, Digest>>,
     runTiming: { readonly startedAt: DateTime.Utc; readonly deadline: DateTime.Utc },
     yieldAfter?: DateTime.Utc,
   ) =>
@@ -4874,8 +4874,6 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
               undefined,
               journalSeed,
             );
-
-      const currentContracts = yield* contractsFor(agent.definition);
 
       const rolloverOperation =
         journal.pendingContextToolCallId === undefined
@@ -8130,6 +8128,10 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
               definition: { ...registeredAgent.definition, policy: childPolicy },
             };
 
+      // Restoring the accepted child policy changes no Tool declarations. Retain the
+      // selected registration's contracts instead of resolving the copied Definition.
+      const currentContracts = yield* contractsFor(registeredAgent.definition);
+
       const evidence = yield* evidenceFor(records, submissionId, true, snapshot.hostSubmissionId);
       const knownIds = knownRecordIdsOf(records);
 
@@ -8225,7 +8227,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
           reconciliationRecords,
           reconciliationEvidence.openToolCalls,
           knownIds,
-          { definition: agent.definition, contracts: yield* contractsFor(agent.definition) },
+          { definition: agent.definition, contracts: currentContracts },
         );
 
         if (review.uncertain.length > 0 || review.unproven.length > 0) {
@@ -8265,7 +8267,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
       if (continuation !== undefined) {
         const current = {
           definition: agent.definition,
-          contracts: yield* contractsFor(agent.definition),
+          contracts: currentContracts,
         };
 
         const operations = operationsFor(continuationRecords, runIdForSubmission(submissionId));
@@ -8440,6 +8442,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
           journalMetadata?.snapshot(),
           lineage,
           approvalDecisionIntents,
+          currentContracts,
           runTiming,
           yieldAfter,
         );
@@ -8885,9 +8888,6 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
       );
     });
 
-  const resolveCurrentBinding = (submission: SubmissionSnapshot) =>
-    resolveWorkerBinding(registeredBindings, submission.agentId);
-
   const processThreadResolvedImpl = (
     threadId: ThreadId,
   ): Effect.Effect<ReadonlyArray<Settlement>, DurableWorkerFailure | DurableBindingFailure> =>
@@ -9137,7 +9137,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
       records,
       evidence.openToolCalls.filter((call) => markableIds.has(call.toolCallId)),
       knownIds,
-      yield* currentOperationsFor(submission.agentId),
+      yield* currentOperationsFor(submission),
     );
 
     let disposition: "repaired" | "deferred" | "unknown";
@@ -9176,7 +9176,7 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
     if (!snapshot.unknownResolutions.some((intent) => intent.resolution._tag === "SafeToRetry"))
       return false;
     const submission = snapshot.submission;
-    const current = yield* currentOperationsFor(submission.agentId);
+    const current = yield* currentOperationsFor(submission);
     const operations = operationsFor(records, runIdForSubmission(submission.submissionId));
 
     for (const intent of snapshot.unknownResolutions) {
@@ -11114,6 +11114,29 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
   }).pipe(Effect.provideService(WorkerRuntime, workerRuntime));
 
   return DurableAgentRuntime.of({
+    bindingRegistryKey: yield* withCrypto(
+      digestJson({
+        selection: bindingSelection?.key ?? null,
+        bindings: (yield* Effect.forEach(registeredBindings, (binding) =>
+          withCrypto(
+            digestJson({
+              agentId: binding.agentId,
+              agent: binding.digests.agent,
+              model: binding.digests.model,
+              tools: binding.digests.tools,
+              replay:
+                binding.digests.replay === undefined
+                  ? null
+                  : {
+                      agent: binding.digests.replay.agent,
+                      agentBehavior: binding.digests.replay.agentBehavior ?? null,
+                      tools: binding.digests.replay.tools,
+                    },
+            }),
+          ),
+        ).pipe(Effect.orDie)).sort(),
+      }),
+    ).pipe(Effect.orDie),
     workerHost: workerRuntime.acquire,
     messagingHost: messagingRuntime.acquire,
     submitRegistered,
@@ -11205,6 +11228,8 @@ const make = Effect.fn("DurableAgentRuntime.make")(function* (
 export class DurableAgentRuntime extends Context.Service<
   DurableAgentRuntime,
   {
+    /** Stable registration identity for hosts parking unavailable bindings; never an admission authority. */
+    readonly bindingRegistryKey: string;
     /** Acquire an authenticated source Thread facet; its References confer no authority. */
     readonly workerHost: (request: {
       readonly sourceThreadId: ThreadId;
@@ -11456,7 +11481,7 @@ export class DurableAgentRuntime extends Context.Service<
 >()("@effect-agent/thread/DurableAgentRuntime") {
   /**
    * Resolve typed registrations and capture their services once in the runtime's Layer Scope.
-   * Every claimed head must match an exact registered identity and digest triple. Worker calls
+   * Every claimed head must select exactly one current registered Definition. Worker calls
    * cannot replace these registrations or their captured services. Tool authorization is required.
    */
   static layerRegistered<const Entries extends ReadonlyArray<AgentRegistration>>(

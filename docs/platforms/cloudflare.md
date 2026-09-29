@@ -151,9 +151,14 @@ Each registration supplies an agent definition, its model Layer, and explicit ag
 tool versions. The submitter passes `digestDefinitions(travelDefinitions)` through
 `DurableSubmitOptions.definitions`. Bump the agent revision when instructions, schemas, or policy
 change. Version tool implementations and model configuration when they change. Register one
-current binding per stable `agentId`: queued and resumed work uses the current binding without
-requiring historical agent or toolbox versions. Accepted inputs and prepared deliveries keep
-their original identities and payloads.
+current binding per stable `agentId` by default. Hosts with intentionally shared identities can
+provide `CurrentBindingSelection` from `effect-agent/agent-registration` when constructing the
+runtime. Its `select(submission)` returns an exact registered Definition using canonical input
+and authoritative host state; `undefined` retains unique-identity resolution. Both execution
+and recovery use this selection. Set a stable `key` and change it when routing changes. Selection
+does not bypass input decoding, operation replay contracts, or authorization. Queued work keeps
+its original identity, digests and payload without requiring historical executable versions.
+Worker declarations and peer-messaging endpoints still require unique Agent identities.
 
 Application layers can use `WorkerEnvironment`, `DurableObjectState`,
 `ThreadObjectIdentity`, and Crypto. Scalar Worker vars and secrets are available through Effect
@@ -291,14 +296,14 @@ prevents another claim. `explainThread` exposes parked operations for authorized
 
 Failed and no-progress passes preserve the dirty generation and use jittered exponential
 backoff up to `alarmBackoffCap` (5 seconds by default).
-Missing agent bindings wait 5, 10, 20, 40, then 60 seconds between attempts;
-further attempts remain one minute apart. The retry deadline survives eviction:
-`ensureAlarm` and early alarm deliveries cannot accelerate native recovery for the same
-generation. A newer durable mutation can wake it immediately, and host deadlines remain
-independently serviceable. Each blocked Thread retains its own waiting period, so it cannot
-monopolize other Threads. Binding refusals still fail closed and retain the original submission.
-There is no terminal retry-count limit: dropping the alarm would strand accepted work after a
-later deployment that registers the agent. An obsolete pending tool operation does not wait for
+Missing or duplicate agent bindings park the original submission and report the refusal once.
+Interruption before the wait commits can repeat the report; reporting is not exactly once.
+The wait survives eviction and does not schedule an alarm. Unrelated host work and aborts
+remain serviceable. On the next invocation with changed registered identities, definition
+digests, or selection key, constructor maintenance clears binding waits and schedules one native pass. A dormant
+Object still needs an invocation after deployment; deployment alone does not invoke it.
+The original receipt, admission evidence and unresolved tool or child obligations remain intact.
+An obsolete pending tool operation does not wait for
 historical code: it receives an unavailable result when no mutation was dispatched, or stays
 unknown when an external effect may have occurred.
 
