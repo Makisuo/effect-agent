@@ -6801,7 +6801,16 @@ const makeTurn = <
           const settleOrFollowUp = (history: Prompt.Prompt) =>
             Effect.gen(function* () {
               yield* advanceHistory(context, history, options);
-              const steering = yield* drainInputs(context, options);
+
+              // Do not consume durable receipts that this completed Turn cannot cover.
+              // Final-answer mode permits one grace Turn, but never a second finalization.
+              const turnsBlocked =
+                policy.onExhaustion === "fail" ? turn >= bounds.maxTurns : turn > bounds.maxTurns;
+
+              const steering =
+                turnsBlocked || context.finalizationUsed
+                  ? []
+                  : yield* drainInputs(context, options);
 
               const queued =
                 steering.length > 0
@@ -6813,9 +6822,6 @@ const makeTurn = <
                 // `maxTurns` (RUN-019): `turn > maxTurns` can only be
                 // `maxTurns + 1`, so a second grace is structurally
                 // impossible.
-                const turnsBlocked =
-                  policy.onExhaustion === "fail" ? turn >= bounds.maxTurns : turn > bounds.maxTurns;
-
                 if (turnsBlocked) {
                   return failRunEventStream(
                     AgentPolicyError.make({
@@ -7229,9 +7235,24 @@ const toolBatchContinuation = <
         }
       }
 
-      if (Option.isSome(selectedOutput)) {
+      // A completion Tool can admit steering while its handler runs. Only claim it
+      // when another ordinary Turn can cover it; otherwise keep it queued for a new Run.
+      const bounds = effectiveRunBounds(agent.definition.policy, options);
+
+      const canContinue =
+        turn < bounds.maxTurns &&
+        (completion?.required === true
+          ? toolCalls + context.programmaticToolCalls < bounds.maxToolCalls
+          : toolCalls + context.programmaticToolCalls <= bounds.maxToolCalls) &&
+        !context.tokenExhausted &&
+        !context.finalizationUsed &&
+        (yield* Clock.currentTimeMillis) < context.durationDeadlineMillis;
+
+      const steering =
+        Option.isSome(selectedOutput) && !canContinue ? [] : yield* drainInputs(context, options);
+
+      if (Option.isSome(selectedOutput) && steering.length === 0) {
         const output = selectedOutput.value;
-        const bounds = effectiveRunBounds(agent.definition.policy, options);
 
         const exhausted = context.tokenExhausted
           ? "tokens"
@@ -7267,7 +7288,6 @@ const toolBatchContinuation = <
           ),
         );
       }
-      const steering = yield* drainInputs(context, options);
       const nextPrompt = yield* appendInputs(context, history, steering, options);
 
       return nextTurn(nextPrompt, turn + 1, toolCalls);
