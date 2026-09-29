@@ -1,6 +1,7 @@
 import { DoStorageFailpoint } from "@effect-agent/storage-cloudflare/do-storage-failpoint";
 import { submissionLedgerLayer } from "@effect-agent/storage-cloudflare/do-submission-ledger";
 import {
+  invalidate,
   storageConfigLayer,
   threadStoreLayer,
 } from "@effect-agent/storage-cloudflare/do-thread-store";
@@ -219,7 +220,7 @@ const corruptHistory = (owner: string, thread: string, sequence = 1) =>
       sequence,
     );
 
-    return row.record_json;
+    return Effect.runPromise(invalidate(state.storage).pipe(Effect.as(row.record_json)));
   });
 
 // Regression: https://github.com/danieljvdm/effect-agent/commit/35b5e858
@@ -625,15 +626,15 @@ describe("recovery faults independent of execution history", () => {
           ["changed", later.submissionId, "defect"],
         ]);
 
-        yield* storage(owner, (state) =>
-          state.storage.sql
-            .exec(
-              "UPDATE effect_agent_canonical_records SET record_json = ? WHERE thread_id = ? AND sequence = 2",
-              original,
-              thread,
-            )
-            .toArray(),
-        );
+        yield* storage(owner, (state) => {
+          state.storage.sql.exec(
+            "UPDATE effect_agent_canonical_records SET record_json = ? WHERE thread_id = ? AND sequence = 2",
+            original,
+            thread,
+          );
+
+          return Effect.runPromise(invalidate(state.storage));
+        });
         const changed = yield* retainedFault(owner, thread);
 
         if (Option.isNone(changed)) throw new Error("Expected changed fault");
