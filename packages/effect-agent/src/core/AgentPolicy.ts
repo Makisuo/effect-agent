@@ -67,6 +67,11 @@ const AgentPolicyFields = Schema.Struct({
   runStatus: Schema.Literals(["appended", "off"]),
   /** Restart a disposable model call on joined input, at most twice per Run. Default off. */
   restartOnJoinedInput: Schema.optionalKey(Schema.Boolean),
+  /**
+   * Retries per model call after a transient provider failure (a retryable `AiError`, or a
+   * 429/5xx stream error part) that arrives before any content. Exponential backoff. Default off.
+   */
+  modelRetries: Schema.optionalKey(NonNegativeInt),
   compaction: CompactionPolicy,
 }).check(
   Schema.makeFilter((policy) =>

@@ -44,6 +44,14 @@ AgentPolicy.make({
 `AgentPolicyError.limit` names a failed bound. DN and DC persist the same value in
 `SubmissionSettled.policyLimit`.
 
+## Transient provider failures
+
+`modelRetries` repeats a model call that failed before streaming any content, when the failure
+is a retryable `AiError` or a stream error part with a 429 or 5xx status. Waits double from one
+second up to thirty, or follow the provider's `retryAfter`, and count toward `maxDuration`. A
+call that already streamed text, reasoning, or a tool call is never repeated. The default is `0`,
+which surfaces the first failure unchanged.
+
 ## Exhaustion: final answer or failure
 
 `onExhaustion: "final-answer"` is the default for turns, tool calls, and tokens.

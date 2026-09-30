@@ -690,6 +690,8 @@ interface TurnTrace {
   response?: ModelResponseIdentity;
   finishMetadata?: Response.FinishPart["metadata"];
   usageConsumed?: boolean;
+  /** The stream error part carried a retryable HTTP status. */
+  transientErrorPart?: boolean;
 }
 
 type ProviderResultEventPayload =
@@ -3965,6 +3967,28 @@ const snapshotCompactionMessages = Effect.fnUntraced(function* (
   });
 });
 
+/** A stream error payload whose HTTP status (`code` or `status`) maps to a retryable reason. */
+const isTransientErrorPayload = (error: unknown): boolean => {
+  if (typeof error !== "object" || error === null) return false;
+
+  const status =
+    "code" in error && typeof error.code === "number"
+      ? error.code
+      : "status" in error && typeof error.status === "number"
+        ? error.status
+        : undefined;
+
+  return status !== undefined && AiError.reasonFromHttpStatus({ status }).isRetryable;
+};
+
+/** Content streamed before a failure makes the call unsafe to repeat. */
+const hasStreamedContent = (trace: TurnTrace): boolean =>
+  trace.toolCalls.size > 0 ||
+  trace.parts.some((part) => part.type !== "response-metadata" && part.type !== "error");
+
+const MODEL_RETRY_BASE = Duration.seconds(1);
+const MODEL_RETRY_MAX_DELAY = Duration.seconds(30);
+
 /** Text a provider overflow classification matches against (message + reason). */
 const overflowText = (error: AiError.AiError): string => `${error.message} ${error.reason.message}`;
 
@@ -5101,6 +5125,8 @@ const eventsForPart = Effect.fnUntraced(function* <Tools extends Record<string, 
       ];
     }
     case "error": {
+      trace.transientErrorPart = isTransientErrorPayload(part.error);
+
       return yield* ModelProtocolError.make({
         message: `Model response failed: ${errorMessage(part.error)}`,
       });
@@ -6462,11 +6488,63 @@ const makeTurn = <
           ),
         );
 
+      // A transient provider failure before any content repeats the call with
+      // backoff. Only response metadata and the error part reached the trace.
+      const attemptWithRetries = (retry = 0): ReturnType<typeof attempt> =>
+        attempt(compactedOutgoing()).pipe(
+          Stream.catch((error) => {
+            const transient =
+              trace.transientErrorPart === true ||
+              (error instanceof AiError.AiError && error.isRetryable);
+
+            delete trace.transientErrorPart;
+            if (!transient || retry >= (policy.modelRetries ?? 0) || hasStreamedContent(trace)) {
+              return Stream.fail(error);
+            }
+
+            const backoff = Duration.min(
+              Duration.times(MODEL_RETRY_BASE, 2 ** retry),
+              MODEL_RETRY_MAX_DELAY,
+            );
+
+            const retryAfter = error instanceof AiError.AiError ? error.retryAfter : undefined;
+
+            const delay =
+              retryAfter === undefined
+                ? backoff
+                : Duration.clamp(retryAfter, { minimum: backoff, maximum: MODEL_RETRY_MAX_DELAY });
+
+            return Stream.unwrap(
+              Effect.gen(function* () {
+                trace.parts.length = 0;
+                trace.responsePartCount = 0;
+                trace.responsePartBytes = 0;
+                // The failed attempt's usage was already retained on exit.
+                trace.usage = undefined;
+                delete trace.response;
+                delete trace.finishMetadata;
+                yield* Effect.logWarning("agent model call retrying").pipe(
+                  Effect.annotateLogs({
+                    runId: context.runId,
+                    turnId,
+                    retry: retry + 1,
+                    delayMillis: Duration.toMillis(delay),
+                    error: errorMessage(error),
+                  }),
+                );
+                yield* Effect.sleep(delay);
+
+                return attemptWithRetries(retry + 1);
+              }),
+            );
+          }),
+        );
+
       // RUN-027: one summarize-and-retry for a classified provider context
       // overflow when compaction is configured; every other provider error
       // propagates unchanged. A response that already streamed parts mutated
       // the trace, so it is never retried.
-      const response = attempt(compactedOutgoing()).pipe(
+      const response = attemptWithRetries().pipe(
         Stream.catch(
           (
             error,
@@ -6540,7 +6618,7 @@ const makeTurn = <
 
                 // The retried call is outside the outer catch: a second
                 // classified overflow converts here, typed, no retry.
-                const retried: TurnStream = attempt(compactedOutgoing()).pipe(
+                const retried: TurnStream = attemptWithRetries().pipe(
                   Stream.catch((again): TurnStream =>
                     again instanceof AiError.AiError &&
                     isContextOverflowMessage(overflowText(again))
