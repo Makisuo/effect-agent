@@ -146,10 +146,13 @@ export type LifecyclePublicationBatch = typeof LifecyclePublicationBatch.Type;
 
 /** Native recovery state, independent of Attempts. Hosts serialize drains per storage owner. */
 export interface LifecyclePublicationStorage {
-  /** Select up to `limit` due owners, with a bounded pending prefix for each selected owner. */
+  /** Select up to `limit` due owners, with a bounded pending prefix for each selected owner.
+   * `retainedOnly` excludes unmaterialized source facts, for a precommitted start prefix.
+   */
   readonly pending: (
     nowMillis: number,
     limit: number,
+    options?: { readonly retainedOnly?: boolean },
   ) => Effect.Effect<ReadonlyArray<LifecyclePublicationBatch>, LifecyclePublicationError>;
   /** Atomically acknowledge the exact batch, retaining its identities and fingerprints. */
   readonly acknowledge: (
@@ -166,6 +169,15 @@ export interface LifecyclePublicationStorage {
     timeoutMillis: number,
   ) => Effect.Effect<boolean, LifecyclePublicationError>;
   readonly pendingDeadline: Effect.Effect<Option.Option<number>, LifecyclePublicationError>;
+  /**
+   * Deadline for `pending(..., { retainedOnly: true })`, excluding unmaterialized source facts.
+   * Source-backed stores provide this when `pendingDeadline` also includes source intent.
+   * Otherwise `pendingDeadline` already describes retained work.
+   */
+  readonly retainedPendingDeadline?: Effect.Effect<
+    Option.Option<number>,
+    LifecyclePublicationError
+  >;
   /** Explicit operator retry after repairing a parked owner's destination. */
   readonly retryParked: (
     ownerThreadId: ThreadId,
@@ -259,9 +271,10 @@ export const drainLifecyclePublications = Effect.fn("LifecyclePublication.drain"
   storage: LifecyclePublicationStorage,
   timeoutMillis = 10_000,
   limit = 4,
+  options?: { readonly retainedOnly?: boolean },
 ) {
   const handler = yield* LifecyclePublicationHandler;
-  const pending = yield* storage.pending(yield* Clock.currentTimeMillis, limit);
+  const pending = yield* storage.pending(yield* Clock.currentTimeMillis, limit, options);
 
   let failures: Cause.Cause<LifecyclePublicationError> = Cause.empty;
 

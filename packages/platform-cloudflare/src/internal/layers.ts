@@ -725,6 +725,13 @@ const sharedLayer = <A, E, R, PE = never, PR = never>(
                             )
                               ? []
                               : [DueQueue.Lifecycle]),
+                            ...(options.lifecyclePublication !== undefined &&
+                            request.batch.records.some(
+                              ({ payload }) =>
+                                payload._tag === "RunStarted" || payload._tag === "SubagentStarted",
+                            )
+                              ? [DueQueue.LifecycleStart]
+                              : []),
                           ],
                         },
                       )
@@ -914,26 +921,45 @@ const sharedLayer = <A, E, R, PE = never, PR = never>(
                       : error;
                   };
 
-                  const deadline = (
-                    storage === undefined
+                  const deadline = (retainedOnly = false) =>
+                    (storage === undefined
                       ? Effect.fail(failure("Native lifecycle storage unavailable"))
-                      : storage.pendingDeadline.pipe(Effect.mapError(failure))
-                  ).pipe(
-                    Effect.withErrorReporting,
-                    Effect.catchCauseIf(
-                      (cause) => !Cause.hasInterrupts(cause),
-                      (cause) =>
-                        Effect.logError("Lifecycle publication deadline unavailable", cause).pipe(
-                          Effect.andThen(
-                            Effect.map(Clock.currentTimeMillis, (now) => Option.some(now + 60_000)),
+                      : (retainedOnly
+                          ? (storage.retainedPendingDeadline ?? storage.pendingDeadline)
+                          : storage.pendingDeadline
+                        ).pipe(Effect.mapError(failure))
+                    ).pipe(
+                      Effect.withErrorReporting,
+                      Effect.catchCauseIf(
+                        (cause) => !Cause.hasInterrupts(cause),
+                        (cause) =>
+                          Effect.logError("Lifecycle publication deadline unavailable", cause).pipe(
+                            Effect.andThen(
+                              Effect.map(Clock.currentTimeMillis, (now) =>
+                                Option.some(now + 60_000),
+                              ),
+                            ),
                           ),
-                        ),
-                    ),
-                  );
+                      ),
+                    );
 
                   return {
                     lanes: [
                       ...previous.lanes,
+                      {
+                        id: DueQueue.LifecycleStart,
+                        dispatchTimeoutMillis: 60_000,
+                        run:
+                          storage === undefined
+                            ? Effect.fail(failure("Native lifecycle storage unavailable"))
+                            : drainLifecyclePublications(storage, 10_000, 4, {
+                                retainedOnly: true,
+                              }).pipe(
+                                Effect.provide(context),
+                                Effect.mapError(failure),
+                                Effect.andThen(deadline(true)),
+                              ),
+                      },
                       {
                         id: DueQueue.Lifecycle,
                         phase: "after-native",
@@ -945,7 +971,7 @@ const sharedLayer = <A, E, R, PE = never, PR = never>(
                             : drainLifecyclePublications(storage).pipe(
                                 Effect.provide(context),
                                 Effect.mapError(failure),
-                                Effect.andThen(deadline),
+                                Effect.andThen(deadline()),
                               ),
                       },
                     ],

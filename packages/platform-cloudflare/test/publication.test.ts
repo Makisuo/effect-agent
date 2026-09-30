@@ -5,13 +5,15 @@ import { ThreadId } from "effect-agent/identifiers";
 import { ApprovalDecisionCommand, SubmissionLedger } from "effect-agent/submission-ledger";
 import { DurableObject } from "effect-cf";
 import { TestClock } from "effect/testing";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import { ThreadMaintenance } from "../src/Alarm.ts";
 import { CloudflareThreadClient } from "../src/CloudflareThreadClient.ts";
 import * as DueQueue from "../src/internal/due-queue.ts";
 import {
   approvalDefinition,
+  bookDefinition,
+  bookToolHolds,
   plannerDefinition,
   submitOptions,
   maintenanceClocks,
@@ -41,6 +43,7 @@ import {
   publicationResources,
   failedLifecycleThreads,
   lifecycleBatches,
+  lifecyclePublicationControls,
 } from "./publication-fixture.ts";
 
 const namespace = "PUBLICATIONS";
@@ -83,7 +86,10 @@ const generation = (thread: string) =>
 
 const submit = (
   thread: string,
-  definition: typeof plannerDefinition | typeof approvalDefinition = plannerDefinition,
+  definition:
+    | typeof plannerDefinition
+    | typeof approvalDefinition
+    | typeof bookDefinition = plannerDefinition,
 ) =>
   runClient(
     Effect.gen(function* () {
@@ -130,6 +136,8 @@ const withThread = (
           failedLifecycleThreads.delete(thread);
           lifecycleBatches.delete(thread);
           modelRequestHolds.delete(thread);
+          bookToolHolds.delete(thread);
+          lifecyclePublicationControls.delete(thread);
           publicationControls.delete(thread);
           publicationResources.delete(thread);
           maintenanceClocks.delete(thread);
@@ -153,6 +161,142 @@ const latch = () => {
 };
 
 describe("durable host publication", () => {
+  // Regression: 405916b0 cleared concurrent publication after the first eight-fact batch.
+  // A single-admission Run cannot expose start progress hidden behind queued readiness facts.
+  it("publishes start progress behind a queued backlog while the provider remains held", () =>
+    withThread(async (thread) => {
+      await submit(thread);
+      await quiesce(thread);
+      lifecycleBatches.delete(thread);
+      const entered = latch();
+      const release = latch();
+
+      modelRequestHolds.set(
+        thread,
+        Effect.sync(entered.resolve).pipe(Effect.andThen(Effect.promise(() => release.promise))),
+      );
+      for (let index = 0; index < 10; index++)
+        await runClient(
+          CloudflareThreadClient.use((client) =>
+            client.submit(
+              { definition: plannerDefinition },
+              { question: "backlog", ref: thread },
+              submitOptions(thread, `backlog-${index}`),
+            ),
+          ),
+          namespace,
+        );
+      const running = alarm(thread);
+
+      try {
+        await entered.promise;
+        await vi.waitFor(
+          () => {
+            const batches = lifecycleBatches.get(thread) ?? [];
+
+            expect(batches.flat().some((p) => p.fact._tag === "RunStarted")).toBe(true);
+            expect(batches.every((batch) => batch.length <= 8)).toBe(true);
+            expect(batches.flat().some((p) => p.fact._tag === "SubmissionSettled")).toBe(false);
+          },
+          { timeout: 2_000 },
+        );
+      } finally {
+        release.resolve();
+        await running;
+      }
+      await quiesce(thread);
+    }, true));
+
+  // Regression: #713 deferred the entire start prefix until native execution settled.
+  // a87f948f then rescheduled empty start waves for undrainable canonical Tool intent.
+  // Hold the Tool and delay acknowledgement to expose that suffix before the deadline check.
+  it("publishes start progress, then stays dormant during a held tool until settlement", () =>
+    withThread(async (thread, _now, advance) => {
+      const entered = latch();
+      const release = latch();
+      const acknowledge = latch();
+
+      bookToolHolds.set(
+        thread,
+        Effect.sync(entered.resolve).pipe(Effect.andThen(Effect.promise(() => release.promise))),
+      );
+      lifecyclePublicationControls.set(thread, { release: acknowledge.promise });
+      await submit(thread, bookDefinition);
+      const running = alarm(thread);
+      const interrupted = running.catch(() => undefined);
+
+      const startLane = () =>
+        runInDurableObject(stub(thread), (_, state) =>
+          DueQueue.make(state.storage)
+            .read()
+            .find((row) => row.id === DueQueue.LifecycleStart),
+        );
+
+      let dormantObserved = false;
+
+      try {
+        await entered.promise;
+        acknowledge.resolve();
+
+        const prepared = await runInDurableObject(stub(thread), (_, state) =>
+          Schema.decodeUnknownSync(Schema.Struct({ prepared: Schema.Natural }))(
+            state.storage.sql
+              .exec(
+                "SELECT COUNT(*) AS prepared FROM effect_agent_canonical_records WHERE json_extract(record_json, '$.payload._tag') = 'ToolCallPrepared'",
+              )
+              .one(),
+          ),
+        );
+
+        expect(prepared.prepared).toBe(1);
+        await vi.waitFor(
+          () => {
+            expect((lifecycleBatches.get(thread) ?? []).flat().map((p) => p.fact._tag)).toEqual([
+              "SubmissionReady",
+              "UserInputRecorded",
+              "RunStarted",
+            ]);
+          },
+          { timeout: 500 },
+        );
+        await vi.waitFor(async () => {
+          expect((await lifecycleRows(thread)).every((row) => row.payload_json === null)).toBe(
+            true,
+          );
+        });
+        await vi.waitFor(async () => expect((await startLane())?.dueAt).toBeNull());
+        dormantObserved = true;
+        const dormant = await startLane();
+
+        await advance(15_000);
+        expect(await startLane()).toEqual(dormant);
+        expect(await allSettled(thread, namespace)()).toBe(false);
+        expect((lifecycleBatches.get(thread) ?? []).flat()).toHaveLength(3);
+      } finally {
+        acknowledge.resolve();
+        release.resolve();
+        if (dormantObserved) await running;
+        else {
+          // A broken immediate continuation must not strand cleanup at the frozen event clock.
+          await runInDurableObject(stub(thread), (_, state) =>
+            state.abort("failed start-publication dormancy assertion"),
+          ).catch(() => undefined);
+          await interrupted;
+        }
+      }
+      await quiesce(thread);
+      const batches = lifecycleBatches.get(thread) ?? [];
+
+      expect(batches.flat().map((p) => p.fact._tag)).toEqual([
+        "SubmissionReady",
+        "UserInputRecorded",
+        "RunStarted",
+        "SubmissionSettled",
+      ]);
+      expect(batches.at(-1)?.map((p) => p.fact._tag)).toEqual(["SubmissionSettled"]);
+      expect((await lifecycleRows(thread)).every((row) => row.payload_json === null)).toBe(true);
+    }, true));
+
   // Regression: c68edc7a made host publication an execution prerequisite.
   it("runs routed and alarm attempts with publication debt, then publishes bounded ordered batches", () =>
     withThread(async (thread, _now, advance) => {
