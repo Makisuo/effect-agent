@@ -690,8 +690,6 @@ interface TurnTrace {
   response?: ModelResponseIdentity;
   finishMetadata?: Response.FinishPart["metadata"];
   usageConsumed?: boolean;
-  /** The stream error part carried a retryable HTTP status. */
-  transientErrorPart?: boolean;
 }
 
 type ProviderResultEventPayload =
@@ -3967,19 +3965,22 @@ const snapshotCompactionMessages = Effect.fnUntraced(function* (
   });
 });
 
-/** A stream error payload whose HTTP status (`code` or `status`) maps to a retryable reason. */
-const isTransientErrorPayload = (error: unknown): boolean => {
-  if (typeof error !== "object" || error === null) return false;
+const HttpStatus = AiError.HttpResponseDetails.fields.status.check(
+  Schema.isBetween({ minimum: 100, maximum: 599 }),
+);
 
-  const status =
-    "code" in error && typeof error.code === "number"
-      ? error.code
-      : "status" in error && typeof error.status === "number"
-        ? error.status
-        : undefined;
+const decodeHttpErrorPayload = Schema.decodeUnknownOption(
+  Schema.Union([Schema.Struct({ code: HttpStatus }), Schema.Struct({ status: HttpStatus })]),
+);
 
-  return status !== undefined && AiError.reasonFromHttpStatus({ status }).isRetryable;
-};
+/** Native error parts carry unknown payloads; classify only validated HTTP statuses. */
+const isTransientErrorPayload = (error: Response.ErrorPart["error"]): boolean =>
+  Option.exists(
+    decodeHttpErrorPayload(error),
+    (payload) =>
+      AiError.reasonFromHttpStatus({ status: "code" in payload ? payload.code : payload.status })
+        .isRetryable,
+  );
 
 /** Content streamed before a failure makes the call unsafe to repeat. */
 const hasStreamedContent = (trace: TurnTrace): boolean =>
@@ -5125,8 +5126,6 @@ const eventsForPart = Effect.fnUntraced(function* <Tools extends Record<string, 
       ];
     }
     case "error": {
-      trace.transientErrorPart = isTransientErrorPayload(part.error);
-
       return yield* ModelProtocolError.make({
         message: `Model response failed: ${errorMessage(part.error)}`,
       });
@@ -5613,6 +5612,12 @@ const makeTurn = <
               )
               .map((entry) => entry.tool)),
       ) as unknown as Toolkit.Toolkit<Tools>;
+
+      // Hosted tools may execute before emitting a response part. Only readonly
+      // hosted tools are safe to repeat after a failure or joined-input restart.
+      const canRepeatModelCall = !Object.values(modelToolkit.tools).some(
+        (tool) => Tool.isProviderDefined(tool) && !Context.get(tool.annotations, Tool.Readonly),
+      );
 
       if (options.durability !== undefined && snapshot !== undefined) {
         if (
@@ -6493,12 +6498,18 @@ const makeTurn = <
       const attemptWithRetries = (retry = 0): ReturnType<typeof attempt> =>
         attempt(compactedOutgoing()).pipe(
           Stream.catch((error) => {
+            const lastPart = trace.parts.at(-1);
+
             const transient =
-              trace.transientErrorPart === true ||
+              (lastPart?.type === "error" && isTransientErrorPayload(lastPart.error)) ||
               (error instanceof AiError.AiError && error.isRetryable);
 
-            delete trace.transientErrorPart;
-            if (!transient || retry >= (policy.modelRetries ?? 0) || hasStreamedContent(trace)) {
+            if (
+              !canRepeatModelCall ||
+              !transient ||
+              retry >= (policy.modelRetries ?? 0) ||
+              hasStreamedContent(trace)
+            ) {
               return Stream.fail(error);
             }
 
@@ -6509,10 +6520,7 @@ const makeTurn = <
 
             const retryAfter = error instanceof AiError.AiError ? error.retryAfter : undefined;
 
-            const delay =
-              retryAfter === undefined
-                ? backoff
-                : Duration.clamp(retryAfter, { minimum: backoff, maximum: MODEL_RETRY_MAX_DELAY });
+            const delay = retryAfter === undefined ? backoff : Duration.max(backoff, retryAfter);
 
             return Stream.unwrap(
               Effect.gen(function* () {
@@ -7227,15 +7235,11 @@ const makeTurn = <
 
       // Only the model stream is cancellable. It resolves no application Tools and
       // closes its waiter before continuation can commit a response or start a Handler.
-      // Hosted effects may happen before reporting a part. Only Tools explicitly
-      // annotated Readonly are safe to discard and repeat.
       const restartSignal =
         policy.restartOnJoinedInput === true &&
         context.modelRestarts < 2 &&
         (options.durability === undefined || options.durability.commitModelRestart !== undefined) &&
-        !Object.values(modelToolkit.tools).some(
-          (tool) => Tool.isProviderDefined(tool) && !Context.get(tool.annotations, Tool.Readonly),
-        )
+        canRepeatModelCall
           ? options.input?.awaitJoin
           : undefined;
 

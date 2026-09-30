@@ -2,4 +2,4 @@
 "effect-agent": minor
 ---
 
-Retry model calls that fail transiently before streaming any content with `AgentPolicy.make({ ..., modelRetries: 3 })`, covering retryable `AiError` failures and 429/5xx stream error parts with exponential backoff.
+Add `AgentPolicy.modelRetries` to retry transient model failures before content streams, honoring provider retry delays and requiring readonly hosted tools.
