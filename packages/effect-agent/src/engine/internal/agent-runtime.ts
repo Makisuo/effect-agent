@@ -16,6 +16,7 @@ import {
   PubSub,
   Queue,
   Result,
+  Schedule,
   Schema,
   SchemaAST,
   SchemaGetter,
@@ -6493,36 +6494,31 @@ const makeTurn = <
           ),
         );
 
-      // A transient provider failure before any content repeats the call with
-      // backoff. Only response metadata and the error part reached the trace.
-      const attemptWithRetries = (retry = 0): ReturnType<typeof attempt> =>
-        attempt(compactedOutgoing()).pipe(
-          Stream.catch((error) => {
-            const lastPart = trace.parts.at(-1);
+      // Retry after part processing: metadata emits no events, so it cannot reset
+      // Stream.retry's schedule. Content makes the response ineligible for retry.
+      const attemptWithRetries = Stream.suspend(() => attempt(compactedOutgoing())).pipe(
+        Stream.retry(($) =>
+          $(Schedule.exponential(MODEL_RETRY_BASE)).pipe(
+            Schedule.upTo({ times: policy.modelRetries ?? 0 }),
+            Schedule.while(({ input: error }) => {
+              const lastPart = trace.parts.at(-1);
 
-            const transient =
-              (lastPart?.type === "error" && isTransientErrorPayload(lastPart.error)) ||
-              (error instanceof AiError.AiError && error.isRetryable);
+              return (
+                canRepeatModelCall &&
+                !hasStreamedContent(trace) &&
+                ((lastPart?.type === "error" && isTransientErrorPayload(lastPart.error)) ||
+                  (AiError.isAiError(error) && error.isRetryable))
+              );
+            }),
+            Schedule.modifyDelay(({ input: error, duration }) => {
+              const backoff = Duration.min(duration, MODEL_RETRY_MAX_DELAY);
+              const retryAfter = AiError.isAiError(error) ? error.retryAfter : undefined;
 
-            if (
-              !canRepeatModelCall ||
-              !transient ||
-              retry >= (policy.modelRetries ?? 0) ||
-              hasStreamedContent(trace)
-            ) {
-              return Stream.fail(error);
-            }
-
-            const backoff = Duration.min(
-              Duration.times(MODEL_RETRY_BASE, 2 ** retry),
-              MODEL_RETRY_MAX_DELAY,
-            );
-
-            const retryAfter = error instanceof AiError.AiError ? error.retryAfter : undefined;
-
-            const delay = retryAfter === undefined ? backoff : Duration.max(backoff, retryAfter);
-
-            return Stream.unwrap(
+              return Effect.succeed(
+                retryAfter === undefined ? backoff : Duration.max(backoff, retryAfter),
+              );
+            }),
+            Schedule.tap(({ input: error, attempt: retry, duration }) =>
               Effect.gen(function* () {
                 trace.parts.length = 0;
                 trace.responsePartCount = 0;
@@ -6535,24 +6531,22 @@ const makeTurn = <
                   Effect.annotateLogs({
                     runId: context.runId,
                     turnId,
-                    retry: retry + 1,
-                    delayMillis: Duration.toMillis(delay),
+                    retry,
+                    delayMillis: Duration.toMillis(duration),
                     error: errorMessage(error),
                   }),
                 );
-                yield* Effect.sleep(delay);
-
-                return attemptWithRetries(retry + 1);
               }),
-            );
-          }),
-        );
+            ),
+          ),
+        ),
+      );
 
       // RUN-027: one summarize-and-retry for a classified provider context
       // overflow when compaction is configured; every other provider error
       // propagates unchanged. A response that already streamed parts mutated
       // the trace, so it is never retried.
-      const response = attemptWithRetries().pipe(
+      const response = attemptWithRetries.pipe(
         Stream.catch(
           (
             error,
@@ -6561,10 +6555,7 @@ const makeTurn = <
             AgentRuntimeFailure<typeof agent, HookError, InstructionError>,
             InterpreterRequirements<typeof agent, HookRequirements, InstructionRequirements>
           > => {
-            if (
-              !(error instanceof AiError.AiError) ||
-              !isContextOverflowMessage(overflowText(error))
-            ) {
+            if (!AiError.isAiError(error) || !isContextOverflowMessage(overflowText(error))) {
               return Stream.fail(error);
             }
             const message = overflowText(error);
@@ -6600,8 +6591,7 @@ const makeTurn = <
                   .pipe(
                     Effect.mapError(
                       (inner): AgentRuntimeFailure<typeof agent, HookError, InstructionError> =>
-                        inner instanceof AiError.AiError &&
-                        isContextOverflowMessage(overflowText(inner))
+                        AiError.isAiError(inner) && isContextOverflowMessage(overflowText(inner))
                           ? ContextOverflowError.make({
                               message: overflowText(inner),
                               retried: true,
@@ -6626,10 +6616,9 @@ const makeTurn = <
 
                 // The retried call is outside the outer catch: a second
                 // classified overflow converts here, typed, no retry.
-                const retried: TurnStream = attemptWithRetries().pipe(
+                const retried: TurnStream = attemptWithRetries.pipe(
                   Stream.catch((again): TurnStream =>
-                    again instanceof AiError.AiError &&
-                    isContextOverflowMessage(overflowText(again))
+                    AiError.isAiError(again) && isContextOverflowMessage(overflowText(again))
                       ? Stream.fail(
                           ContextOverflowError.make({
                             message: overflowText(again),
